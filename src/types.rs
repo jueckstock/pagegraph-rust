@@ -2,13 +2,23 @@
 #[derive(Clone, PartialEq, Debug)]
 pub enum NodeType {
     Extensions {},
-    RemoteFrame { url: String },
-    Resource { url: String },
-    AdFilter { rule: String },
-    TrackerFilter,  // TODO
-    FingerprintingFilter,   // TODO
-    WebApi { method: String },
-    JsBuiltin { method: String },
+    RemoteFrame {
+        frame_id: String,
+    },
+    Resource {
+        url: String,
+    },
+    AdFilter {
+        rule: String,
+    },
+    TrackerFilter,        // TODO
+    FingerprintingFilter, // TODO
+    WebApi {
+        method: String,
+    },
+    JsBuiltin {
+        method: String,
+    },
     HtmlElement {
         tag_name: String,
         is_deleted: bool,
@@ -45,6 +55,7 @@ pub enum NodeType {
     TrackersShield {},
     JavascriptShield {},
     FingerprintingShield {},
+    FingerprintingV2Shield {},
 }
 
 #[derive(Clone, PartialEq, Debug)]
@@ -97,19 +108,26 @@ pub enum EdgeType {
         before: Option<usize>,
     },
     CreateNode {},
-    JsResult { value: Option<String> },
-    JsCall { args: Option<String> },
+    JsResult {
+        value: Option<String>,
+    },
+    JsCall {
+        args: Option<String>,
+        pos: Option<usize>,
+    },
     RequestComplete {
         resource_type: String,
         status: String,
-        value: String,
+        headers: String,
+        size: isize,
         response_hash: Option<String>,
         request_id: usize,
     },
     RequestError {
         status: String,
         request_id: usize,
-        value: String,
+        headers: String,
+        size: isize,
     },
     RequestStart {
         request_type: RequestType,
@@ -139,11 +157,17 @@ pub enum EdgeType {
         key: String,
         value: Option<String>,
     },
-    DeleteStorage { key: String },
-    ReadStorageCall { key: String },
-    ClearStorage { key: String },
+    DeleteStorage {
+        key: String,
+    },
+    ReadStorageCall {
+        key: String,
+    },
+    ClearStorage { key: Option<String> },
     StorageBucket {},
-    ExecuteFromAttribute { attr_name: String },
+    ExecuteFromAttribute {
+        attr_name: String,
+    },
     Execute {},
     SetAttribute {
         key: String,
