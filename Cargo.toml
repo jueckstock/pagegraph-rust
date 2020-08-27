@@ -8,10 +8,12 @@ readme = "README.md"
 [dependencies]
 xml-rs = "^ 0.8"
 petgraph = {git = "https://github.com/antonok-edm/petgraph", rev = "edges-undirected", version = "^ 0.5", default_features = false, features = ["graphmap"]}
-adblock = "^ 0.2"
+adblock = "^ 0.3"
 url = "^ 2.1"
 addr = "^ 0.2"
 rayon = "^ 1.4"
+csv = "^ 1.1"
+serde_derive = "^ 1.0"
 
 [dev-dependencies]
 reqwest = "^ 0.9"

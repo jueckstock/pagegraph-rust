@@ -68,8 +68,8 @@ impl graph::PageGraphMeta {
         }
         Self {
             version: version_string.expect("`version` missing from metadata block"),
-            url: url_string,
-            is_root: if is_root_string.is_some() { Some(is_root_string.unwrap() == "true") } else { None },
+            url: url_string.expect("`url` missing from metadatablock"),
+            is_root: is_root_string.expect("`is_root` missing from metadatablock") == "true",
         }
     }
 }

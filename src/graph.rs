@@ -8,8 +8,8 @@ use crate::types::{ NodeType, EdgeType };
 #[derive(Debug)]
 pub struct PageGraphMeta {
     pub version: String,
-    pub url: Option<String>,
-    pub is_root: Option<bool>,
+    pub url: String,
+    pub is_root: bool,
 }
 
 /// The main PageGraph data structure.
