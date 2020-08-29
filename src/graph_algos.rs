@@ -3,6 +3,8 @@ use crate::types::{ EdgeType, NodeType };
 
 use petgraph::Direction;
 
+use itertools::Itertools;
+
 impl PageGraph {
     pub fn filter_edges<F: Fn(&EdgeType) -> bool>(&self, f: F) -> Vec<(&EdgeId, &Edge)> {
         self.edges.iter().filter(|(_id, edge)| {
@@ -292,6 +294,59 @@ impl PageGraph {
         }
 
         already_checked.into_iter().map(|node_id| (node_id, self.nodes.get(&node_id).unwrap())).collect()
+    }
+
+    pub fn post_contact_script_actions<F: Fn(&NodeType) -> bool>(&self, contact_node_filter: F) -> Vec::<(&Node, Vec::<(&EdgeId, NodeId)>)> {
+        // Find the contact nodes of interest
+        let contacted_nodes: Vec<_> = self.filter_nodes(contact_node_filter);
+
+        // Find the list of (script_node_id, earliest_edge_id_to_storage_node) tuples for each contact node in the graph
+        let mut first_storage_accesses: Vec<_> = contacted_nodes.into_iter().map(|(contacted_node_id, _)| {
+            let contacted_node_id = *contacted_node_id;
+            self.graph.neighbors_directed(contacted_node_id, Direction::Incoming).filter_map(|script_node_id| {
+                let script_node = self.nodes.get(&script_node_id).unwrap();
+                if let NodeType::Script { .. } = script_node.node_type {
+                    if let Some(min_edge_id) = self.graph.edge_weight(script_node_id, contacted_node_id).unwrap().into_iter().min() {
+                        return Some((script_node_id, min_edge_id))
+                    }
+                }
+                None
+            })
+            .map(|(script_node_id, earliest_edge_id)| {
+                (script_node_id, *earliest_edge_id)
+            })
+            .collect::<Vec<(NodeId, EdgeId)>>()
+        })
+        .flatten()
+        .collect();
+
+        // Collapse down to just (script_node, vector-of-edges-after-first-storage-access)
+        first_storage_accesses.sort_unstable();
+        let payload: Vec<_> = first_storage_accesses.iter()
+            .group_by(|(node_id, _)| node_id)
+            .into_iter().map(|(script_node_id, group)| {
+                let (_, earliest_edge_id) = group.min_by_key(|(_, eid)| eid).unwrap();
+                let script_node = self.nodes.get(script_node_id).unwrap();
+                let mut edge_history: Vec<_> = self.graph.neighbors_directed(*script_node_id, Direction::Outgoing).flat_map(|target_id| {
+                    let edge_ids = self.graph.edge_weight(*script_node_id, target_id).unwrap();
+                    edge_ids.into_iter().map(move |edge_id| {
+                        (edge_id, target_id)
+                    })
+                })
+                .filter_map(|(edge_id, target_id)| {
+                    if edge_id >= earliest_edge_id {
+                        Some((edge_id, target_id))
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+                edge_history.sort_unstable_by_key(|(edge_id, _)| *edge_id);
+                (script_node, edge_history)
+            })
+            .collect();
+        
+        payload
     }
 }
 

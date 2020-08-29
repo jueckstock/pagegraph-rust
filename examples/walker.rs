@@ -120,6 +120,7 @@ struct FeatureVector {
     touched_dom_nodes: usize,
     completed_requests: usize,
     event_listenings: usize,
+    post_storage_script_edges: usize,
 }
 
 fn main() {
@@ -177,6 +178,7 @@ fn main() {
                         touched_dom_nodes: 0,
                         completed_requests: 0,
                         event_listenings: 0,
+                        post_storage_script_edges: 0,
                     };
                     graphs.into_iter().for_each(|g| {
                         rec.total_nodes += g.nodes.len();
@@ -204,6 +206,14 @@ fn main() {
                                 _ => false,
                             }
                         }).len();
+
+                        let script_actions = g.post_contact_script_actions(|nt| match nt {
+                            NodeType::LocalStorage { } => true,
+                            NodeType::CookieJar { } => true,
+                            _ => false,
+                        });
+                        let script_action_tally: usize = script_actions.into_iter().map(|(_, history)| history.len()).sum();
+                        rec.post_storage_script_edges += script_action_tally;
                     });
 
                     if let Err(e) = wtr_mut.lock().unwrap().serialize(rec) {
