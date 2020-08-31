@@ -113,6 +113,8 @@ fn stem_to_origin_url(stem: &Path) -> String {
 struct FeatureVector {
     site_tag: String,
     profile_tag: String,
+    is_root: bool,
+    is_ad: bool,
     total_nodes: usize,
     total_edges: usize,
     total_dom_nodes: usize,
@@ -147,42 +149,46 @@ fn main() {
                 // compute "origin URL" from the directory structure (or panic)
                 let origin_url = stem_to_origin_url(&stem);
                 
-                // use metadata and adblock rules to identify 3p-non-ad-URL remote frames
+                // use metadata and adblock rules to identify tag graphs as main/remote and (if remote) ad/not-ad
                 let abp_sender = root_sender.lock().unwrap().clone();
-                let graph_map: ProfileGraphMap = graph_map.into_iter().map(|(profile, graphs)| {
+                let graph_map: Vec<_> = graph_map.into_iter().map(|(profile, graphs)| {
                     let abp_sender = abp_sender.clone();
                     let (client_sender, client_receiver) = channel();
                     (profile.clone(), graphs.into_iter().filter_map(|g| {
                         if let Some(ref meta) = g.meta {
-                            if !meta.is_root {
+                            let is_root = meta.is_root;
+                            let mut is_ad = false;
+                            if !is_root {
                                 let _ = abp_sender.send((meta.url.clone(), origin_url.clone(), client_sender.clone()));
                                 match client_receiver.recv() {
-                                    Ok(is_match) if is_match => return Some(g),
+                                    Ok(is_match) if is_match => { is_ad = true }
                                     _ => {}
                                 }
                             }
+                            return Some((is_root, is_ad, g))
                         }
                         None
                     }).collect())
                 }).collect();
 
                 // extract features of interest from these graphs
-                graph_map.into_iter().for_each(|(profile, graphs)| {
-                    let mut rec = FeatureVector {
-                        site_tag: stem.to_str().unwrap().to_owned(),
-                        profile_tag: profile.clone(),
-                        total_nodes: 0,
-                        total_edges: 0,
-                        total_dom_nodes: 0,
-                        net_dom_nodes: 0,
-                        touched_dom_nodes: 0,
-                        completed_requests: 0,
-                        event_listenings: 0,
-                        post_storage_script_edges: 0,
-                    };
-                    graphs.into_iter().for_each(|g| {
-                        rec.total_nodes += g.nodes.len();
-                        rec.total_edges += g.edges.len();
+                graph_map.into_iter().for_each(|arg: (String, Vec<(bool, bool, PageGraph)>)| {
+                    let (profile, graphs) = arg;
+                    graphs.into_iter().for_each(|(is_root, is_ad, g)| {
+                        let mut rec = FeatureVector {
+                            site_tag: stem.to_str().unwrap().to_owned(),
+                            profile_tag: profile.clone(),
+                            is_root: is_root,
+                            is_ad: is_ad,
+                            total_nodes: g.nodes.len(),
+                            total_edges: g.edges.len(),
+                            total_dom_nodes: 0,
+                            net_dom_nodes: 0,
+                            touched_dom_nodes: 0,
+                            completed_requests: 0,
+                            event_listenings: 0,
+                            post_storage_script_edges: 0,
+                        };
                         g.nodes.iter().for_each(|(id, node)| {
                             match node.node_type {
                                 NodeType::HtmlElement { is_deleted, .. } => {
@@ -214,11 +220,11 @@ fn main() {
                         });
                         let script_action_tally: usize = script_actions.into_iter().map(|(_, history)| history.len()).sum();
                         rec.post_storage_script_edges += script_action_tally;
-                    });
 
-                    if let Err(e) = wtr_mut.lock().unwrap().serialize(rec) {
-                        eprintln!("error: {:?}", e);
-                    }
+                        if let Err(e) = wtr_mut.lock().unwrap().serialize(rec) {
+                            eprintln!("error: {:?}", e);
+                        }
+                    });
                 });
             });
             wtr_mut.lock().unwrap().flush().expect("error flushing CSV output stream?!");
