@@ -101,6 +101,24 @@ fn launch_adblock_server(filterset_blob: Vec<u8>) ->
     (sender, handle)
 }
 
+// um, unnecessary (turns out List implements the Sync trait...)
+fn launch_publicsuffix_server(public_suffix_list: publicsuffix::List) -> (Sender<(String, Sender<Option<String>>)>, JoinHandle<Result<(), publicsuffix::errors::Error>>) {
+    let (sender, receiver) = channel::<(String, Sender<Option<String>>)>();
+
+    let handle = spawn(move || {
+        for (domain_name, sase) in receiver {
+            let domain = public_suffix_list.parse_domain(&domain_name)?;
+            let _ = sase.send(match domain.root() {
+                Some(s) => Some(s.to_owned()),
+                None => None,
+            });
+        }
+        Ok(())
+    });
+
+    (sender, handle)
+}
+
 fn stem_to_origin_url(stem: &Path) -> String {
     if let std::path::Component::Normal(p) = stem.components().next().expect("missing first component of stem path?!") {
         let hostname = p.to_str().expect("bad filename (not utf8)");
@@ -113,6 +131,7 @@ fn stem_to_origin_url(stem: &Path) -> String {
 struct FeatureVector {
     site_tag: String,
     profile_tag: String,
+    url_etld1: Option<String>,
     is_root: bool,
     is_ad: bool,
     total_nodes: usize,
@@ -134,7 +153,11 @@ fn main() {
 
     let filterset_blob = std::fs::read("filterset.dat").expect("unable to read `filterset.dat`");
     let (abp_sender, _) = launch_adblock_server(filterset_blob);
-    let root_sender = Mutex::new(abp_sender);
+    let root_abp_sender = Mutex::new(abp_sender);
+
+    let psl = publicsuffix::List::from_path("public_suffix_list.dat").expect("unable to read `public_suffix_list.dat`");
+    let (psl_sender, _) = launch_publicsuffix_server(psl);
+    let root_psl_sender = Mutex::new(psl_sender);
 
     let wtr = csv::Writer::from_writer(std::io::stdout());
     let wtr_mut = Mutex::new(wtr);
@@ -150,34 +173,48 @@ fn main() {
                 let origin_url = stem_to_origin_url(&stem);
                 
                 // use metadata and adblock rules to identify tag graphs as main/remote and (if remote) ad/not-ad
-                let abp_sender = root_sender.lock().unwrap().clone();
+                // also use metadata and PSL data to bundle each graph with its root URL eTLD+1
+                let abp_sender = root_abp_sender.lock().unwrap().clone();
+                let psl_sender = root_psl_sender.lock().unwrap().clone();
                 let graph_map: Vec<_> = graph_map.into_iter().map(|(profile, graphs)| {
                     let abp_sender = abp_sender.clone();
-                    let (client_sender, client_receiver) = channel();
+                    let (abp_client_sender, abp_client_receiver) = channel();
+                    let (psl_client_sender, psl_client_receiver) = channel();
                     (profile.clone(), graphs.into_iter().filter_map(|g| {
                         if let Some(ref meta) = g.meta {
                             let is_root = meta.is_root;
                             let mut is_ad = false;
                             if !is_root {
-                                let _ = abp_sender.send((meta.url.clone(), origin_url.clone(), client_sender.clone()));
-                                match client_receiver.recv() {
+                                let _ = abp_sender.send((meta.url.clone(), origin_url.clone(), abp_client_sender.clone()));
+                                match abp_client_receiver.recv() {
                                     Ok(is_match) if is_match => { is_ad = true }
                                     _ => {}
                                 }
                             }
-                            return Some((is_root, is_ad, g))
+                            let mut url_etld1 = None;
+                            if let Ok(u) = url::Url::parse(&meta.url) {
+                                if let Some(hostname) = u.host_str() {
+                                    let _ = psl_sender.send((hostname.to_owned(), psl_client_sender.clone()));
+                                    match psl_client_receiver.recv() {
+                                        Ok(etld1) => url_etld1 = etld1,
+                                        _ => {}
+                                    }
+                                }
+                            }
+                            return Some((is_root, is_ad, url_etld1, g))
                         }
                         None
                     }).collect())
                 }).collect();
 
                 // extract features of interest from these graphs
-                graph_map.into_iter().for_each(|arg: (String, Vec<(bool, bool, PageGraph)>)| {
+                graph_map.into_iter().for_each(|arg: (String, Vec<(bool, bool, Option<String>, PageGraph)>)| {
                     let (profile, graphs) = arg;
-                    graphs.into_iter().for_each(|(is_root, is_ad, g)| {
+                    graphs.into_iter().for_each(|(is_root, is_ad, url_etld1, g)| {
                         let mut rec = FeatureVector {
                             site_tag: stem.to_str().unwrap().to_owned(),
                             profile_tag: profile.clone(),
+                            url_etld1: url_etld1,
                             is_root: is_root,
                             is_ad: is_ad,
                             total_nodes: g.nodes.len(),
