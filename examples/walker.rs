@@ -8,6 +8,9 @@ use std::sync::mpsc::{channel, Sender};
 
 use rayon::prelude::*;
 use adblock::engine::Engine;
+use regex::Regex;
+use petgraph::Direction;
+use cookie::Cookie;
 
 use pagegraph::from_xml::read_from_file;
 use pagegraph::graph::PageGraph;
@@ -15,6 +18,9 @@ use pagegraph::types::{NodeType, EdgeType};
 
 #[macro_use]
 extern crate serde_derive;
+
+#[macro_use]
+extern crate lazy_static;
 
 /// Approximate Python's os.walk() generator function using a mutable callback closure
 fn walk(dir: &Path, cb: &mut dyn FnMut(&Path, &Vec<PathBuf>, Vec<PathBuf>) -> Result<(), Box<dyn std::error::Error>>) -> Result<(), Box<dyn std::error::Error>> {
@@ -101,30 +107,142 @@ fn launch_adblock_server(filterset_blob: Vec<u8>) ->
     (sender, handle)
 }
 
-// um, unnecessary (turns out List implements the Sync trait...)
-fn launch_publicsuffix_server(public_suffix_list: publicsuffix::List) -> (Sender<(String, Sender<Option<String>>)>, JoinHandle<Result<(), publicsuffix::errors::Error>>) {
-    let (sender, receiver) = channel::<(String, Sender<Option<String>>)>();
-
-    let handle = spawn(move || {
-        for (domain_name, sase) in receiver {
-            let domain = public_suffix_list.parse_domain(&domain_name)?;
-            let _ = sase.send(match domain.root() {
-                Some(s) => Some(s.to_owned()),
-                None => None,
-            });
-        }
-        Ok(())
-    });
-
-    (sender, handle)
-}
-
 fn stem_to_origin_url(stem: &Path) -> String {
     if let std::path::Component::Normal(p) = stem.components().next().expect("missing first component of stem path?!") {
         let hostname = p.to_str().expect("bad filename (not utf8)");
         return format!("https://{0}/", hostname);
     }
     panic!("invalid first component of stem path!")
+}
+
+fn raw_header_triples<'a>(headers: &'a str, prefix_filter: Option<&str>) -> Vec<(&'a str, &'a str, &'a str)> {
+    lazy_static!{
+        static ref RE: Regex = Regex::new(r#"^([-a-zA-Z0-9_]+):"(\S+)" "(.*)"$"#).expect("regex error?!");
+    }
+    let mut triples = Vec::new();
+    for line in headers.split_terminator('\n') {
+        if let Some(m) = RE.captures(line) {
+            let header_prefix = m.get(1).unwrap().as_str();
+            if prefix_filter.unwrap_or(header_prefix) == header_prefix {
+                let header_name = m.get(2).unwrap().as_str();
+                let header_value = m.get(3).unwrap().as_str();
+                triples.push((header_prefix, header_name, header_value))
+            }
+        }
+    }
+    triples
+}
+
+#[derive(Debug, Serialize, Hash, Eq, PartialEq)]
+enum PrivacyTokenSource {
+    QueryParam,
+    RawHeader,
+    Cookie,
+}
+
+#[derive(Debug, Serialize, Hash, Eq, PartialEq)]
+struct PrivacyTokenFlow {
+    profile: String,
+    site_etld1: String,
+    http_etld1: String,
+    source: PrivacyTokenSource,
+    key: String,
+    value: String,
+}
+
+fn url_host_etld1(raw_url: &str, psl: &publicsuffix::List) -> Option<String> {
+    if let Ok(u) = url::Url::parse(raw_url) {
+        if let Some(hostname) = u.host_str() {
+            if let Ok(domain) = psl.parse_domain(&hostname) {
+                if let Some(s) = domain.root() {
+                    return Some(s.to_owned());
+                }
+            }
+        }
+    }
+    None
+}
+
+fn extract_privacy_flows(site_tag: &str, profile_tag: &str, g: &PageGraph, psl: &publicsuffix::List) -> std::collections::HashSet<PrivacyTokenFlow> {
+    let mut flows: std::collections::HashSet<PrivacyTokenFlow> = std::collections::HashSet::new();
+    
+    let resources = g.filter_nodes(|nt| match nt {
+        NodeType::Resource { .. } => true,
+        _ => false,
+    });
+
+    let site_host = site_tag.splitn(2, '/').next().unwrap();
+    let site_etld1 = match psl.parse_domain(site_host) {
+        Ok(domain) => domain.root().unwrap().to_owned(),
+        _ => site_host.to_owned(),
+    };
+
+    for (node_id, node) in resources {
+        if let NodeType::Resource { ref url } = node.node_type {
+            if let Some(url_etld1) = url_host_etld1(url, psl) {
+                // Ignore same-eTLD+1 traffic
+                if url_etld1 != site_etld1 {
+                    // if we can parse the query string, add its name/value pairs
+                    if let Ok(url_fields) = url::Url::parse(url) {
+                        for (name, value) in url_fields.query_pairs() {
+                            flows.insert(PrivacyTokenFlow{
+                                profile: profile_tag.to_owned(),
+                                site_etld1: site_etld1.clone(),
+                                http_etld1: url_etld1.clone(),
+                                source: PrivacyTokenSource::QueryParam,
+                                key: name.to_owned().to_string(),
+                                value: value.to_owned().to_string(),
+                            });
+                        }
+                    }
+
+                    // find all request-completed edges out from this node
+                    // and parse their headers for flows
+                    let all_headers: Vec<_> = g.graph.neighbors_directed(*node_id, Direction::Outgoing)
+                        .flat_map(|actor_node_id| {
+                            let edge_ids = g.graph.edge_weight(*node_id, actor_node_id).unwrap();
+                            edge_ids
+                        })
+                        .map(|edge_id| (edge_id, g.edges.get(edge_id).unwrap()))
+                        .filter_map(|(_id, edge)| {
+                            match &edge.edge_type {
+                                EdgeType::RequestComplete { headers, .. } => Some(headers),
+                                _ => None,
+                            }
+                        })
+                        .collect();
+                    for header_block in all_headers {
+                        for (_, name, value) in raw_header_triples(&header_block, Some("raw-request")) {
+                            if name.to_ascii_lowercase() == "cookie" {
+                                for morsel in value.split_terminator(';') {
+                                    if let Ok(c) = Cookie::parse(morsel) {
+                                        flows.insert(PrivacyTokenFlow{
+                                            profile: profile_tag.to_owned(),
+                                            site_etld1: site_etld1.clone(),
+                                            http_etld1: url_etld1.clone(),
+                                            source: PrivacyTokenSource::Cookie,
+                                            key: c.name().to_owned().to_string(),
+                                            value: c.value().to_owned().to_string(),
+                                        });
+                                    }
+                                }
+                            } else {
+                                flows.insert(PrivacyTokenFlow{
+                                    profile: profile_tag.to_owned(),
+                                    site_etld1: site_etld1.clone(),
+                                    http_etld1: url_etld1.clone(),
+                                    source: PrivacyTokenSource::RawHeader,
+                                    key: name.to_owned().to_string(),
+                                    value: value.to_owned().to_string(),
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    flows
 }
 
 #[derive(Debug, Serialize)]
@@ -156,8 +274,9 @@ fn main() {
     let root_abp_sender = Mutex::new(abp_sender);
 
     let psl = publicsuffix::List::from_path("public_suffix_list.dat").expect("unable to read `public_suffix_list.dat`");
-    let (psl_sender, _) = launch_publicsuffix_server(psl);
-    let root_psl_sender = Mutex::new(psl_sender);
+
+    let privacy_wtr = csv::Writer::from_path("privacy_metrics.csv").expect("unable to write `privacy_metrics.csv`");
+    let privacy_wtr_mut = Mutex::new(privacy_wtr);
 
     let wtr = csv::Writer::from_writer(std::io::stdout());
     let wtr_mut = Mutex::new(wtr);
@@ -175,11 +294,9 @@ fn main() {
                 // use metadata and adblock rules to identify tag graphs as main/remote and (if remote) ad/not-ad
                 // also use metadata and PSL data to bundle each graph with its root URL eTLD+1
                 let abp_sender = root_abp_sender.lock().unwrap().clone();
-                let psl_sender = root_psl_sender.lock().unwrap().clone();
                 let graph_map: Vec<_> = graph_map.into_iter().map(|(profile, graphs)| {
                     let abp_sender = abp_sender.clone();
                     let (abp_client_sender, abp_client_receiver) = channel();
-                    let (psl_client_sender, psl_client_receiver) = channel();
                     (profile.clone(), graphs.into_iter().filter_map(|g| {
                         if let Some(ref meta) = g.meta {
                             let is_root = meta.is_root;
@@ -191,16 +308,7 @@ fn main() {
                                     _ => {}
                                 }
                             }
-                            let mut url_etld1 = None;
-                            if let Ok(u) = url::Url::parse(&meta.url) {
-                                if let Some(hostname) = u.host_str() {
-                                    let _ = psl_sender.send((hostname.to_owned(), psl_client_sender.clone()));
-                                    match psl_client_receiver.recv() {
-                                        Ok(etld1) => url_etld1 = etld1,
-                                        _ => {}
-                                    }
-                                }
-                            }
+                            let url_etld1 = url_host_etld1(&meta.url, &psl);
                             return Some((is_root, is_ad, url_etld1, g))
                         }
                         None
@@ -210,9 +318,21 @@ fn main() {
                 // extract features of interest from these graphs
                 graph_map.into_iter().for_each(|arg: (String, Vec<(bool, bool, Option<String>, PageGraph)>)| {
                     let (profile, graphs) = arg;
+
+                    let site_tag = stem.to_str().unwrap();
                     graphs.into_iter().for_each(|(is_root, is_ad, url_etld1, g)| {
+                        let ohmy = extract_privacy_flows(site_tag, &profile, &g, &psl);
+                        if ohmy.len() > 0 {
+                            let mut pwtr = privacy_wtr_mut.lock().unwrap();
+                            for flow in ohmy {
+                                if let Err(e) = pwtr.serialize(flow) {
+                                    eprintln!("error: {:?}", e);
+                                }
+                            }
+                        }
+
                         let mut rec = FeatureVector {
-                            site_tag: stem.to_str().unwrap().to_owned(),
+                            site_tag: site_tag.to_owned(),
                             profile_tag: profile.clone(),
                             url_etld1: url_etld1,
                             is_root: is_root,
