@@ -107,7 +107,19 @@ fn launch_adblock_server(filterset_blob: Vec<u8>) ->
     (sender, handle)
 }
 
-fn stem_to_origin_url(stem: &Path) -> String {
+fn retreive_origin_url(stem: &Path, graph_map: &ProfileGraphMap) -> String {
+    // First, try to find is_root==true graphs (should be _1_ per profile) and extract their meta URL field
+    // (we blithely assume the first is_root==true graph we find in any given profile is the correct crawl URL)
+    for (_, graphs) in graph_map {
+        for g in graphs {
+            if let Some(ref meta) = g.meta {
+                if meta.is_root {
+                    return meta.url.clone();
+                }
+            }
+        }
+    }
+
     if let std::path::Component::Normal(p) = stem.components().next().expect("missing first component of stem path?!") {
         let hostname = p.to_str().expect("bad filename (not utf8)");
         return format!("https://{0}/", hostname);
@@ -173,7 +185,10 @@ fn extract_privacy_flows(site_tag: &str, profile_tag: &str, g: &PageGraph, psl: 
 
     let site_host = site_tag.splitn(2, '/').next().unwrap();
     let site_etld1 = match psl.parse_domain(site_host) {
-        Ok(domain) => domain.root().unwrap().to_owned(),
+        Ok(domain) => match domain.root() {
+            Some(etld1) => etld1.to_owned(),
+            None => site_host.to_owned(),
+        },
         _ => site_host.to_owned(),
     };
 
@@ -249,17 +264,26 @@ fn extract_privacy_flows(site_tag: &str, profile_tag: &str, g: &PageGraph, psl: 
 struct FeatureVector {
     site_tag: String,
     profile_tag: String,
+    url: String,
     url_etld1: Option<String>,
     is_root: bool,
     is_ad: bool,
     total_nodes: usize,
     total_edges: usize,
     total_dom_nodes: usize,
-    net_dom_nodes: usize,
+    total_remote_frames: usize,
+    //net_dom_nodes: usize,
     touched_dom_nodes: usize,
     completed_requests: usize,
     event_listenings: usize,
     post_storage_script_edges: usize,
+    post_storage_console_errors: usize,
+}
+
+#[derive(Debug, Deserialize)]
+struct ConsoleLogArgs {
+    level: String,
+    // others not important for us right now
 }
 
 fn main() {
@@ -288,8 +312,8 @@ fn main() {
                 // load all the graphs in this crawl set (i.e., cluster of directories, one per profile)
                 let graph_map = load_graph_cluster(&profile_map);
 
-                // compute "origin URL" from the directory structure (or panic)
-                let origin_url = stem_to_origin_url(&stem);
+                // retrieve the starting crawl URL from the collection of graphs and the stem
+                let origin_url = retreive_origin_url(&stem, &graph_map);
                 
                 // use metadata and adblock rules to identify tag graphs as main/remote and (if remote) ad/not-ad
                 // also use metadata and PSL data to bundle each graph with its root URL eTLD+1
@@ -309,18 +333,18 @@ fn main() {
                                 }
                             }
                             let url_etld1 = url_host_etld1(&meta.url, &psl);
-                            return Some((is_root, is_ad, url_etld1, g))
+                            return Some((is_root, is_ad, meta.url.clone(), url_etld1, g))
                         }
                         None
                     }).collect())
                 }).collect();
 
                 // extract features of interest from these graphs
-                graph_map.into_iter().for_each(|arg: (String, Vec<(bool, bool, Option<String>, PageGraph)>)| {
+                graph_map.into_iter().for_each(|arg: (String, Vec<(bool, bool, String, Option<String>, PageGraph)>)| {
                     let (profile, graphs) = arg;
 
                     let site_tag = stem.to_str().unwrap();
-                    graphs.into_iter().for_each(|(is_root, is_ad, url_etld1, g)| {
+                    graphs.into_iter().for_each(|(is_root, is_ad, full_url, url_etld1, g)| {
                         let ohmy = extract_privacy_flows(site_tag, &profile, &g, &psl);
                         if ohmy.len() > 0 {
                             let mut pwtr = privacy_wtr_mut.lock().unwrap();
@@ -334,26 +358,30 @@ fn main() {
                         let mut rec = FeatureVector {
                             site_tag: site_tag.to_owned(),
                             profile_tag: profile.clone(),
+                            url: full_url,
                             url_etld1: url_etld1,
                             is_root: is_root,
                             is_ad: is_ad,
                             total_nodes: g.nodes.len(),
                             total_edges: g.edges.len(),
                             total_dom_nodes: 0,
-                            net_dom_nodes: 0,
+                            total_remote_frames: 0,
                             touched_dom_nodes: 0,
                             completed_requests: 0,
                             event_listenings: 0,
                             post_storage_script_edges: 0,
+                            post_storage_console_errors: 0,
                         };
                         g.nodes.iter().for_each(|(id, node)| {
                             match node.node_type {
-                                NodeType::HtmlElement { is_deleted, .. } => {
+                                NodeType::HtmlElement { .. } => {
                                     rec.total_dom_nodes += 1;
-                                    if !is_deleted { rec.net_dom_nodes += 1; }
                                     let html_mods = g.all_html_element_modifications(*id);
                                     if html_mods.len() > 2 { rec.touched_dom_nodes += 1; }
-                                }
+                                },
+                                NodeType::RemoteFrame { .. } => {
+                                    rec.total_remote_frames += 1;
+                                },
                                 _ => {}
                             }
                         });
@@ -375,8 +403,31 @@ fn main() {
                             NodeType::CookieJar { } => true,
                             _ => false,
                         });
-                        let script_action_tally: usize = script_actions.into_iter().map(|(_, history)| history.len()).sum();
-                        rec.post_storage_script_edges += script_action_tally;
+                        
+                        script_actions.into_iter().for_each(|(_, edge_history)| {
+                            rec.post_storage_script_edges += edge_history.len();
+                            edge_history.into_iter().for_each(|(edge_id, target_node_id)| {
+                                if let Some(target_node) = g.nodes.get(&target_node_id) {
+                                    match &target_node.node_type {
+                                        NodeType::WebApi { method } if method == "console.log" => {
+                                            if let Some(edge) = g.edges.get(edge_id) {
+                                                match &edge.edge_type {
+                                                    EdgeType::JsCall { args, .. } if args.is_some() => {
+                                                        if let Ok(arg_block) = serde_json::from_str::<ConsoleLogArgs>(args.as_ref().unwrap()) {
+                                                            if arg_block.level == "Error" {
+                                                                rec.post_storage_console_errors += 1;
+                                                            }
+                                                        }
+                                                    }
+                                                    _ => {}
+                                                }
+                                            }
+                                        },
+                                        _ => {}
+                                    }
+                                }
+                            });
+                        });
 
                         if let Err(e) = wtr_mut.lock().unwrap().serialize(rec) {
                             eprintln!("error: {:?}", e);
@@ -384,7 +435,8 @@ fn main() {
                     });
                 });
             });
-            wtr_mut.lock().unwrap().flush().expect("error flushing CSV output stream?!");
+            privacy_wtr_mut.lock().unwrap().flush().expect("error flushing privacy CSV output stream?!");
+            wtr_mut.lock().unwrap().flush().expect("error flushing main CSV output stream?!");
         },
         Err(e) => {
             eprintln!("error: {:?}", e);
