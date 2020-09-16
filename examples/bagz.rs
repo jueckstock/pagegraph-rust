@@ -181,17 +181,18 @@ fn compute_node_feature(node: &NodeType) -> Option<String> {
         NodeType::Resource { ref url } => Some(format!("Resource[{0}]", url)),
         NodeType::WebApi { ref method } => Some(format!("WebAPI[{0}]", method)),
         NodeType::JsBuiltin { ref method } => Some(format!("JsBuiltin[{0}]", method)),
+        NodeType::HtmlElement { ref tag_name, .. } => Some(format!("Html[{0}]", tag_name)),
         NodeType::TextNode { ref text, .. } => match text {
             Some(text_str) => Some(format!("Text[{0}]", text_str)),
             None => Some("Text[]".to_owned()),
         },
         NodeType::DomRoot { ref url, ref tag_name, .. } => match url {
-            Some(url_str) => Some(format!("DomRoot[{0}:{1}]", tag_name, url_host_etld1(url_str).unwrap_or_default())),
+            Some(url_str) => Some(format!("DomRoot[{0}:{1}]", tag_name, url_str)),
             None => Some(format!("DomRoot[{0}]", tag_name)),
         },
         NodeType::FrameOwner { ref tag_name, .. } => Some(format!("FrameOwner[{0}]", tag_name)),
         NodeType::Script { ref url, ref script_type, .. } => match url {
-            Some(url_str) => Some(format!("Script[{0}:{1}]", script_type, url_host_etld1(url_str).unwrap_or_default())),
+            Some(url_str) => Some(format!("Script[{0}:{1}]", script_type, url_str)),
             None => Some(format!("Script[{0}]", script_type)),
         },
         NodeType::LocalStorage { } => Some("LocalStorage".to_owned()),
