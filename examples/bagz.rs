@@ -178,7 +178,7 @@ type FeatureBag = HashSet<String>;
 fn compute_node_feature(node: &NodeType) -> Option<String> {
     match node {
         NodeType::RemoteFrame {..} => Some("RemoteFrame".to_owned()),
-        NodeType::Resource { ref url } => Some(format!("Resource[{0}]", url)),
+        NodeType::Resource { ref url } => Some(format!("Resource[{0}]", url_host_etld1(url).unwrap_or_default())),
         NodeType::WebApi { ref method } => Some(format!("WebAPI[{0}]", method)),
         NodeType::JsBuiltin { ref method } => Some(format!("JsBuiltin[{0}]", method)),
         NodeType::HtmlElement { ref tag_name, .. } => Some(format!("Html[{0}]", tag_name)),
@@ -187,12 +187,12 @@ fn compute_node_feature(node: &NodeType) -> Option<String> {
             None => Some("Text[]".to_owned()),
         },
         NodeType::DomRoot { ref url, ref tag_name, .. } => match url {
-            Some(url_str) => Some(format!("DomRoot[{0}:{1}]", tag_name, url_str)),
+            Some(url_str) => Some(format!("DomRoot[{0}:{1}]", tag_name, url_host_etld1(url_str).unwrap_or_default())),
             None => Some(format!("DomRoot[{0}]", tag_name)),
         },
         NodeType::FrameOwner { ref tag_name, .. } => Some(format!("FrameOwner[{0}]", tag_name)),
         NodeType::Script { ref url, ref script_type, .. } => match url {
-            Some(url_str) => Some(format!("Script[{0}:{1}]", script_type, url_str)),
+            Some(url_str) => Some(format!("Script[{0}:{1}]", script_type, url_host_etld1(url_str).unwrap_or_default())),
             None => Some(format!("Script[{0}]", script_type)),
         },
         NodeType::LocalStorage { } => Some("LocalStorage".to_owned()),
