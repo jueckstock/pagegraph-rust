@@ -10,6 +10,8 @@ use rayon::prelude::*;
 use adblock::engine::Engine;
 use itertools::Itertools;
 use petgraph::Direction;
+use regex::Regex;
+use cookie::Cookie;
 
 use pagegraph::from_xml::read_from_file;
 use pagegraph::graph::PageGraph;
@@ -146,17 +148,17 @@ fn url_host_etld1(raw_url: &str) -> Option<String> {
 struct FeatureVector {
     site_tag: String,
     frame_url: String,
-    //is_root: bool,
-    //is_ad: bool,
+    is_root: bool,
+    is_ad: bool,
     p1: String,
     p2: String,
     node_jaccard: f32,
     edge_jaccard: f32,
 }
 
-fn launch_csv_server() -> (Sender<FeatureVector>, JoinHandle<std::io::Result<()>>) {
-    let (sender, receiver) = channel::<FeatureVector>();
-    let mut wtr = csv::Writer::from_writer(std::io::stdout());
+fn launch_csv_server<T: serde::Serialize + std::marker::Send + 'static, W: std::io::Write + std::marker::Send + 'static>(mut wtr: csv::Writer<W>) -> (Sender<T>, JoinHandle<std::io::Result<()>>) {
+    let (sender, receiver) = channel::<T>();
+    //let mut wtr = csv::Writer::from_writer(std::io::stdout());
     let handle = spawn(move || {
         for record in receiver {
             if let Err(e) = wtr.serialize(record) {
@@ -277,8 +279,8 @@ fn compute_edge_bag(g: &PageGraph) -> FeatureBag {
 }
 
 fn jaccard_similarity(bag1: &FeatureBag, bag2: &FeatureBag) -> f32 {
-    let n = bag1.intersection(bag2).collect::<Vec<_>>().len() as f32;
-    let d = bag1.union(bag2).collect::<Vec<_>>().len() as f32;
+    let n = bag1.intersection(bag2).count() as f32;
+    let d = bag1.union(bag2).count() as f32;
     if d > 0.0 {
         n / d
     } else {
@@ -287,6 +289,117 @@ fn jaccard_similarity(bag1: &FeatureBag, bag2: &FeatureBag) -> f32 {
 }
 
 
+#[derive(Debug, Serialize, Hash, Eq, PartialEq)]
+enum PrivacyTokenSource {
+    QueryParam,
+    RawHeader,
+    Cookie,
+}
+
+#[derive(Debug, Serialize, Hash, Eq, PartialEq)]
+struct PrivacyTokenFlow {
+    profile: String,
+    site_etld1: String,
+    http_etld1: String,
+    source: PrivacyTokenSource,
+    key: String,
+    value: String,
+}
+
+fn raw_header_triples<'a>(headers: &'a str, prefix_filter: Option<&str>) -> Vec<(&'a str, &'a str, &'a str)> {
+    lazy_static!{
+        static ref RE: Regex = Regex::new(r#"^([-a-zA-Z0-9_]+):"(\S+)" "(.*)"$"#).expect("regex error?!");
+    }
+    let mut triples = Vec::new();
+    for line in headers.split_terminator('\n') {
+        if let Some(m) = RE.captures(line) {
+            let header_prefix = m.get(1).unwrap().as_str();
+            if prefix_filter.unwrap_or(header_prefix) == header_prefix {
+                let header_name = m.get(2).unwrap().as_str();
+                let header_value = m.get(3).unwrap().as_str();
+                triples.push((header_prefix, header_name, header_value))
+            }
+        }
+    }
+    triples
+}
+
+fn extract_privacy_flows(site_etld1: &str, profile_tag: &str, g: &PageGraph) -> std::collections::HashSet<PrivacyTokenFlow> {
+    let mut flows: std::collections::HashSet<PrivacyTokenFlow> = std::collections::HashSet::new();
+    
+    let resources = g.filter_nodes(|nt| match nt {
+        NodeType::Resource { .. } => true,
+        _ => false,
+    });
+
+    for (node_id, node) in resources {
+        if let NodeType::Resource { ref url } = node.node_type {
+            if let Some(url_etld1) = url_host_etld1(url) {
+                // Ignore same-eTLD+1 traffic
+                if url_etld1 != site_etld1 {
+                    // if we can parse the query string, add its name/value pairs
+                    if let Ok(url_fields) = url::Url::parse(url) {
+                        for (name, value) in url_fields.query_pairs() {
+                            flows.insert(PrivacyTokenFlow{
+                                profile: profile_tag.to_owned(),
+                                site_etld1: site_etld1.to_owned(),
+                                http_etld1: url_etld1.clone(),
+                                source: PrivacyTokenSource::QueryParam,
+                                key: name.to_owned().to_string(),
+                                value: value.to_owned().to_string(),
+                            });
+                        }
+                    }
+
+                    // find all request-completed edges out from this node
+                    // and parse their headers for flows
+                    let all_headers: Vec<_> = g.graph.neighbors_directed(*node_id, Direction::Outgoing)
+                        .flat_map(|actor_node_id| {
+                            let edge_ids = g.graph.edge_weight(*node_id, actor_node_id).unwrap();
+                            edge_ids
+                        })
+                        .map(|edge_id| (edge_id, g.edges.get(edge_id).unwrap()))
+                        .filter_map(|(_id, edge)| {
+                            match &edge.edge_type {
+                                EdgeType::RequestComplete { headers, .. } => Some(headers),
+                                _ => None,
+                            }
+                        })
+                        .collect();
+                    for header_block in all_headers {
+                        for (_, name, value) in raw_header_triples(&header_block, Some("raw-request")) {
+                            if name.to_ascii_lowercase() == "cookie" {
+                                for morsel in value.split_terminator(';') {
+                                    if let Ok(c) = Cookie::parse(morsel) {
+                                        flows.insert(PrivacyTokenFlow{
+                                            profile: profile_tag.to_owned(),
+                                            site_etld1: site_etld1.to_owned(),
+                                            http_etld1: url_etld1.clone(),
+                                            source: PrivacyTokenSource::Cookie,
+                                            key: c.name().to_owned().to_string(),
+                                            value: c.value().to_owned().to_string(),
+                                        });
+                                    }
+                                }
+                            } else {
+                                flows.insert(PrivacyTokenFlow{
+                                    profile: profile_tag.to_owned(),
+                                    site_etld1: site_etld1.to_owned(),
+                                    http_etld1: url_etld1.clone(),
+                                    source: PrivacyTokenSource::RawHeader,
+                                    key: name.to_owned().to_string(),
+                                    value: value.to_owned().to_string(),
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    flows
+}
+
 fn main() {
     let roots = std::env::args_os().skip(1).collect::<Vec<OsString>>();
     if roots.len() == 0 {
@@ -294,24 +407,17 @@ fn main() {
         return
     }
 
-    /* // TEST: load graphml files directory and dump their node/edge bags
-    let test_graph = read_from_file(roots[0].to_str().unwrap());
-    let node_bag = compute_node_bag(&test_graph);
-    for feature in node_bag {
-        println!("{0}", feature);
-    }
-    println!("-----------------------------------------------------------");
-    for feature in compute_edge_bag(&test_graph) {
-        println!("{0}", feature);
-    } */
-    
-
     let filterset_blob = std::fs::read("filterset.dat").expect("unable to read `filterset.dat`");
     let (abp_sender, abp_thread) = launch_adblock_server(filterset_blob);
     let root_abp_sender = Mutex::new(abp_sender);
 
-    let (wtr_sender, wtr_thread) = launch_csv_server();
+    let stdout_wtr = csv::Writer::from_writer(std::io::stdout());
+    let (wtr_sender, wtr_thread) = launch_csv_server::<FeatureVector, _>(stdout_wtr);
     let root_wtr_sender = Mutex::new(wtr_sender);
+
+    let privacy_wtr = csv::Writer::from_path("privacy_metrics.csv").expect("unable to write `privacy_metrics.csv`");
+    let (pwtr_sender, pwtr_thread) = launch_csv_server::<PrivacyTokenFlow, _>(privacy_wtr);
+    let root_pwtr_sender = Mutex::new(pwtr_sender);
 
     match parse_crawl_map(roots) {
         Ok(mother) => {
@@ -324,16 +430,20 @@ fn main() {
 
                 // retrieve the starting crawl URL from the collection of graphs and the stem
                 let origin_url = retreive_origin_url(&stem, &graph_map);
+                let site_etld1 = url_host_etld1(&origin_url).unwrap_or_default();
 
                 // build an inverted index: frame-url -> profile_name -> graph
                 // use metadata and adblock rules to identify tag graphs as main/remote and (if remote) ad/not-ad
                 // (also use metadata and PSL data to bundle each graph with its root URL eTLD+1)
+                // (also run the privacy-flow extractor on all these graphs)
                 let abp_sender = root_abp_sender.lock().unwrap().clone();
                 let (abp_client_sender, abp_client_receiver) = channel();
+                let pwtr_sender = root_pwtr_sender.lock().unwrap().clone();
                 let mut inverted_index: HashMap<(bool, bool, String), HashMap<String, PageGraph>> = HashMap::new();
                 for (profile, graphs) in graph_map {
                     for g in graphs {
                         if let Some(ref meta) = g.meta {
+                            // metadata mining/ad-block classification
                             let frame_url = meta.url.clone();
                             let is_root = meta.is_root;
                             let mut is_ad = false;
@@ -344,6 +454,13 @@ fn main() {
                                     _ => {}
                                 }
                             }
+
+                            // privacy flow mining (we want flows from _all_ graphs, not just the URL-matched ones we use for similarity analysis)
+                            for flow in extract_privacy_flows(&site_etld1, &profile, &g) {
+                                pwtr_sender.send(flow).expect("failed to send record for privacy flows CSV?");
+                            }
+
+                            // insertion into inverted-index
                             match inverted_index.get_mut(&(is_root, is_ad, frame_url.clone())) {
                                 Some(ref mut index) => {
                                     index.insert(profile.clone(), g);
@@ -360,10 +477,10 @@ fn main() {
                     }
                 }
 
-                // walk the inverted index to find the 3p-no-ad frames with 10 profiles (5 profiles x 2 instances)
+                // walk the inverted index to find graphs/frame-urls with 10 profiles (5 profiles x 2 instances); i.e., same URL loaded for same crawl across all crawls
                 let wtr_sender = root_wtr_sender.lock().unwrap().clone();
                 for ((is_root, is_ad, frame_url), profile_graphs) in inverted_index {
-                    if !is_root && !is_ad && profile_graphs.len() == profile_count {
+                    if profile_graphs.len() == profile_count {
                         // compute node bags for each graph
                         let mut node_bag_map: HashMap<String, FeatureBag> = HashMap::new();
                         let mut edge_bag_map: HashMap<String, HashSet<String>> = HashMap::new();
@@ -391,6 +508,8 @@ fn main() {
                             let record = FeatureVector{
                                 site_tag: stem.to_str().unwrap().to_owned(),
                                 frame_url: frame_url.clone(),
+                                is_root: is_root,
+                                is_ad: is_ad,
                                 p1: p1.to_string(),
                                 p2: p2.to_string(),
                                 node_jaccard: nji,
@@ -408,9 +527,14 @@ fn main() {
         }
     }
 
+    drop(root_pwtr_sender);
+    pwtr_thread.join().expect("error joining/closing privacy CSV output thread");
+    
+    drop(root_wtr_sender);
+    wtr_thread.join().expect("error joining/closing primary CSV output thread");
+    
     drop(root_abp_sender);
     abp_thread.join().expect("error joining/closing ABP server thread");
 
-    drop(root_wtr_sender);
-    wtr_thread.join().expect("error joining/closing CSV output thread");
+    
 }

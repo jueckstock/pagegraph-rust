@@ -1,7 +1,7 @@
 use std::io::prelude::*;
 
 use petgraph::Direction;
-use sha2::{Sha256, Digest};
+use sha2::Digest;
 
 use pagegraph::from_xml::read_from_file;
 use pagegraph::graph::PageGraph;
