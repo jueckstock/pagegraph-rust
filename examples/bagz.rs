@@ -294,6 +294,7 @@ enum PrivacyTokenSource {
     QueryParam,
     RawHeader,
     Cookie,
+    LocalStorageAPI,
 }
 
 #[derive(Debug, Serialize, Hash, Eq, PartialEq)]
@@ -301,6 +302,8 @@ struct PrivacyTokenFlow {
     profile: String,
     site_etld1: String,
     http_etld1: String,
+    is_root: bool,
+    is_ad: bool,
     source: PrivacyTokenSource,
     key: String,
     value: String,
@@ -324,7 +327,7 @@ fn raw_header_triples<'a>(headers: &'a str, prefix_filter: Option<&str>) -> Vec<
     triples
 }
 
-fn extract_privacy_flows(site_etld1: &str, profile_tag: &str, g: &PageGraph) -> std::collections::HashSet<PrivacyTokenFlow> {
+fn extract_privacy_flows(site_etld1: &str, is_root: bool, is_ad: bool, frame_url: &str, profile_tag: &str, g: &PageGraph) -> std::collections::HashSet<PrivacyTokenFlow> {
     let mut flows: std::collections::HashSet<PrivacyTokenFlow> = std::collections::HashSet::new();
     
     let resources = g.filter_nodes(|nt| match nt {
@@ -344,6 +347,8 @@ fn extract_privacy_flows(site_etld1: &str, profile_tag: &str, g: &PageGraph) -> 
                                 profile: profile_tag.to_owned(),
                                 site_etld1: site_etld1.to_owned(),
                                 http_etld1: url_etld1.clone(),
+                                is_root,
+                                is_ad,
                                 source: PrivacyTokenSource::QueryParam,
                                 key: name.to_owned().to_string(),
                                 value: value.to_owned().to_string(),
@@ -375,28 +380,64 @@ fn extract_privacy_flows(site_etld1: &str, profile_tag: &str, g: &PageGraph) -> 
                                             profile: profile_tag.to_owned(),
                                             site_etld1: site_etld1.to_owned(),
                                             http_etld1: url_etld1.clone(),
+                                            is_root,
+                                            is_ad,
                                             source: PrivacyTokenSource::Cookie,
                                             key: c.name().to_owned().to_string(),
                                             value: c.value().to_owned().to_string(),
                                         });
                                     }
                                 }
-                            } else {
+                            } 
+                            // skip raw-headers as they aren't that useful and take a lot of space (and inject all)
+                            /* else {
                                 flows.insert(PrivacyTokenFlow{
                                     profile: profile_tag.to_owned(),
                                     site_etld1: site_etld1.to_owned(),
                                     http_etld1: url_etld1.clone(),
+                                    is_root,
+                                    is_ad,
                                     source: PrivacyTokenSource::RawHeader,
                                     key: name.to_owned().to_string(),
                                     value: value.to_owned().to_string(),
                                 });
-                            }
+                            } */
                         }
                     }
                 }
             }
         }
     }
+
+    let local_storage_node = g.filter_nodes(|nt| match nt {
+        NodeType::LocalStorage { } => true,
+        _ => false,
+    });
+    local_storage_node.into_iter().for_each(|(node_id, _node)| {
+        g.graph.neighbors_directed(*node_id, Direction::Outgoing)
+            .flat_map(|actor_node_id| {
+                let edge_ids = g.graph.edge_weight(*node_id, actor_node_id).unwrap();
+                edge_ids
+            })
+        .map(|edge_id| (edge_id, g.edges.get(edge_id).unwrap()))
+        .for_each(|(_id, edge)| {
+            match &edge.edge_type {
+                EdgeType::StorageReadResult { ref key, ref value } if value.is_some() => {
+                    flows.insert(PrivacyTokenFlow{
+                        profile: profile_tag.to_owned(),
+                        site_etld1: site_etld1.to_owned(),
+                        http_etld1: frame_url.to_owned(),
+                        is_root,
+                        is_ad,
+                        source: PrivacyTokenSource::LocalStorageAPI,
+                        key: key.clone(),
+                        value: value.as_ref().unwrap().clone(),
+                    });
+                },
+                _ => {},
+            }
+        });
+    });
     flows
 }
 
@@ -456,7 +497,7 @@ fn main() {
                             }
 
                             // privacy flow mining (we want flows from _all_ graphs, not just the URL-matched ones we use for similarity analysis)
-                            for flow in extract_privacy_flows(&site_etld1, &profile, &g) {
+                            for flow in extract_privacy_flows(&site_etld1, is_root, is_ad, &frame_url, &profile, &g) {
                                 pwtr_sender.send(flow).expect("failed to send record for privacy flows CSV?");
                             }
 
