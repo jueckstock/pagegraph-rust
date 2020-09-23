@@ -179,7 +179,7 @@ type FeatureBag = HashSet<String>;
 
 fn compute_node_feature(node: &NodeType) -> Option<String> {
     match node {
-        // currently using the "best-edge-subset" (by CM1 score, measuring separation of vanilla from fullblock3p)
+        // trying the union of "best-edge-subset" and "best-node-subset" (by CM1 score, measuring separation of vanilla from fullblock3p)
         NodeType::DomRoot { ref url, ref tag_name, .. } => match url {
             Some(url_str) => Some(format!("DomRoot[{0}:{1}]", tag_name, url_host_etld1(url_str).unwrap_or_default())),
             None => Some(format!("DomRoot[{0}]", tag_name)),
@@ -192,11 +192,11 @@ fn compute_node_feature(node: &NodeType) -> Option<String> {
             None => Some(format!("Script[{0}]", script_type)),
         },
         NodeType::FrameOwner { ref tag_name, .. } => Some(format!("FrameOwner[{0}]", tag_name)),
+        NodeType::Resource { ref url } => Some(format!("Resource[{0}]", url_host_etld1(url).unwrap_or_default())),
+        NodeType::JsBuiltin { ref method } => Some(format!("JsBuiltin[{0}]", method)),
 
         /* NodeType::RemoteFrame {..} => Some("RemoteFrame".to_owned()),
-        NodeType::Resource { ref url } => Some(format!("Resource[{0}]", url_host_etld1(url).unwrap_or_default())),
         NodeType::WebApi { ref method } => Some(format!("WebAPI[{0}]", method)),
-        NodeType::JsBuiltin { ref method } => Some(format!("JsBuiltin[{0}]", method)),
         NodeType::HtmlElement { ref tag_name, .. } => Some(format!("Html[{0}]", tag_name)),
         NodeType::TextNode { ref text, .. } => match text {
             Some(text_str) => Some(format!("Text[{0}]", text_str)),
