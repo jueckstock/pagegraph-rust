@@ -28,13 +28,14 @@ fn compute_node_feature(node: &NodeType) -> Option<String> {
             None => Some(format!("DomRoot[{0}]", tag_name)),
         },
         NodeType::FrameOwner { ref tag_name, .. } => Some(format!("FrameOwner[{0}]", tag_name)),
+        NodeType::LocalStorage { } => Some("LocalStorage".to_owned()),
+        NodeType::SessionStorage { } => Some("SessionStorage".to_owned()),
+        NodeType::CookieJar { } => Some("CookieJar".to_owned()),
         NodeType::Script { ref url, ref script_type, .. } => match url {
             Some(url_str) => Some(format!("Script[{0}:{1}]", script_type, url_str)),
             None => Some(format!("Script[{0}]", script_type)),
         },
-        NodeType::LocalStorage { } => Some("LocalStorage".to_owned()),
-        NodeType::SessionStorage { } => Some("SessionStorage".to_owned()),
-        NodeType::CookieJar { } => Some("CookieJar".to_owned()),
+        NodeType::Parser { } => Some("Parser".to_owned()),
         _ => None
     }
 }
@@ -52,38 +53,38 @@ fn compute_node_bag(g: &PageGraph) -> FeatureBag {
 fn compute_edge_feature(edge: &EdgeType, s1: &str, s2: &str) -> Option<String> {
     match edge {
         // Simple structural/interaction links
-        EdgeType::Structure { } => Some(format!("{0}->{1}", s1, s2)),
-        EdgeType::TextChange { } => Some(format!("{0}-txt->{1}", s1, s2)),
-        EdgeType::CreateNode { } => Some(format!("{0}-create->{1}", s1, s2)),
-        EdgeType::InsertNode { .. } => Some(format!("{0}-insert->{1}", s1, s2)),
-        EdgeType::RemoveNode { }  => Some(format!("{0}-remove->{1}", s1, s2)),
-        EdgeType::DeleteNode { }  => Some(format!("{0}-del->{1}", s1, s2)),
-        EdgeType::JsCall { .. } => Some(format!("{0}-call->{1}", s1, s2)),
-        EdgeType::Execute { } => Some(format!("{0}-exec->{1}", s1, s2)),
+        EdgeType::Structure { } => Some(format!("Structure:{0}->{1}", s1, s2)),
+        EdgeType::TextChange { } => Some(format!("TextChange:{0}->{1}", s1, s2)),
+        EdgeType::CreateNode { } => Some(format!("CreateNode:{0}->{1}", s1, s2)),
+        EdgeType::InsertNode { .. } => Some(format!("InsertNode:{0}->{1}", s1, s2)),
+        EdgeType::RemoveNode { }  => Some(format!("RemoveNode:{0}->{1}", s1, s2)),
+        EdgeType::DeleteNode { }  => Some(format!("DeleteNode:{0}->{1}", s1, s2)),
+        EdgeType::JsCall { .. } => Some(format!("JsCall:{0}->{1}", s1, s2)), // initiation only, not results
+        EdgeType::Execute { } => Some(format!("Execute:{0}->{1}", s1, s2)),
         
         // HTTP actions
-        EdgeType::RequestStart { ref request_type, .. } => Some(format!("{0}-start[{2:?}]->{1}", s1, s2, request_type)),
-        EdgeType::RequestError { ref status, .. } => Some(format!("{0}-error[{2}]->{1}", s1, s2, status)),
-        EdgeType::RequestComplete { ref resource_type, size, .. } => Some(format!("{0}-complete[{2};{3}]->{1}", s1, s2, resource_type, size)),
+        EdgeType::RequestStart { ref request_type, .. } => Some(format!("RequestStart:{0}-[{2:?}]->{1}", s1, s2, request_type)),
+        EdgeType::RequestError { ref status, .. } => Some(format!("RequestError:{0}-[{2}]->{1}", s1, s2, status)),
+        EdgeType::RequestComplete { ref resource_type, size, .. } => Some(format!("RequestComplete:{0}-[{2};{3}]->{1}", s1, s2, resource_type, size)),
         
         // Event listener actions
-        EdgeType::AddEventListener { ref key, .. } => Some(format!("{0}-listen[{2}]->{1}", s1, s2, key)),
-        EdgeType::RemoveEventListener { ref key, .. } => Some(format!("{0}-ignore[{2}]->{1}", s1, s2, key)),
-        EdgeType::EventListener { ref key, .. } => Some(format!("{0}-event[{2}]->{1}", s1, s2, key)),
+        EdgeType::AddEventListener { ref key, .. } => Some(format!("AddEventListener:{0}-[{2}]->{1}", s1, s2, key)),
+        EdgeType::RemoveEventListener { ref key, .. } => Some(format!("RemoveEventListener:{0}-[{2}]->{1}", s1, s2, key)),
+        EdgeType::EventListener { ref key, .. } => Some(format!("EventListener:{0}-[{2}]->{1}", s1, s2, key)),
 
-        // Storage interactions
-        EdgeType::StorageSet { ref key, .. } => Some(format!("{0}-store[{2}]->{1}", s1, s2, key)),
-        EdgeType::ReadStorageCall { ref key, .. } => Some(format!("{0}-read[{2}]->{1}", s1, s2, key)),
-        EdgeType::DeleteStorage { ref key, .. } => Some(format!("{0}-del[{2}]->{1}", s1, s2, key)),
+        // Storage interactions (initiation only, not results)
+        EdgeType::StorageSet { ref key, .. } => Some(format!("StorageSet:{0}-[{2}]->{1}", s1, s2, key)),
+        EdgeType::ReadStorageCall { ref key, .. } => Some(format!("ReadStorageCall:{0}-[{2}]->{1}", s1, s2, key)),
+        EdgeType::DeleteStorage { ref key, .. } => Some(format!("DeleteStorage:{0}-[{2}]->{1}", s1, s2, key)),
         EdgeType::ClearStorage { ref key, .. } => match key {
-            Some(key_str) => Some(format!("{0}-clear[{2}]->{1}", s1, s2, key_str)),
-            None => Some(format!("{0}-clear[]->{1}", s1, s2)),
+            Some(key_str) => Some(format!("ClearStorage:{0}-[{2}]->{1}", s1, s2, key_str)),
+            None => Some(format!("ClearStorage:{0}->{1}", s1, s2)),
         },
 
         // Attribute-related links
-        EdgeType::ExecuteFromAttribute { ref attr_name } => Some(format!("{0}-exec[{2}]->{1}", s1, s2, attr_name)),
-        EdgeType::SetAttribute { ref key, .. } => Some(format!("{0}-setAttr[{2}]->{1}", s1, s2, key)),
-        EdgeType::DeleteAttribute { ref key, .. } => Some(format!("{0}-delAttr[{2}]->{1}", s1, s2, key)),
+        EdgeType::ExecuteFromAttribute { ref attr_name } => Some(format!("ExecuteFromAttribute:{0}-[{2}]->{1}", s1, s2, attr_name)),
+        EdgeType::SetAttribute { ref key, .. } => Some(format!("SetAttribute:{0}-[{2}]->{1}", s1, s2, key)),
+        EdgeType::DeleteAttribute { ref key, .. } => Some(format!("DeleteAttribute:{0}-[{2}]->{1}", s1, s2, key)),
 
         // Anything else is not turned into a feature
         _ => None
